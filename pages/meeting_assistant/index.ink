@@ -281,33 +281,31 @@ export default {
         return;
       }
 
-      const stream = session.promptStreaming(transcript);
-      const chunks = [];
-      while (this.isCurrent(operationId)) {
-        const result = await stream.read();
-        if (result.done) {
-          break;
-        }
-        if (typeof result.value === 'string') {
-          chunks.push(result.value);
-        }
-      }
+      console.log('[MeetingAssistant] prompt start:', transcript);
+      const result = await session.prompt(transcript);
+      console.log('[MeetingAssistant] prompt completed:', result);
 
       if (!this.isCurrent(operationId)) {
         return;
       }
+      const cue = formatCue(result);
       this.setData({
         status: '就绪',
-        cue: formatCue(chunks.join('')),
-        isAnalyzing: false,
-        canAnalyze: true,
+        cue: cue === 'NO_CUE' ? '暂无需追问' : cue,
       });
     } catch (error) {
+      console.error('[MeetingAssistant] prompt failed:', error);
       if (!this.isCurrent(operationId)) {
         return;
       }
       this.setFailure(`分析失败：${getErrorMessage(error)}`);
-      this.setData({ canAnalyze: true });
+    } finally {
+      if (this.isCurrent(operationId)) {
+        this.setData({
+          isAnalyzing: false,
+          canAnalyze: true,
+        });
+      }
     }
   },
 

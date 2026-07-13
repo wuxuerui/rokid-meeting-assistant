@@ -1,0 +1,35 @@
+:root {
+  --theme-color: var(--color-primary, #3498db);
+  --theme-bg: var(--color-surface-highlight, #e8f4f8);
+  --theme-border: var(--border-width-default, 2px) solid var(--card-border-color, var(--theme-color));
+  --theme-radius: var(--radius-md, 12px);
+  --theme-padding: var(--spacing-lg, 20px);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+.container {
+  padding: var(--theme-padding);
+  display: flex;
+  flex-direction: column;
+}
+
+.page-title {
+  font-size: 24px;
+  font-weight: bold;
+  margin-bottom: var(--spacing-lg, 20px);
+  text-align: center;
+}
+
+.card {
+  border: var(--theme-border);
+  border-radius: var(--theme-radius);
+  padding: var(--spacing-md, 16px);
+  margin-bottom: var(--spacing-md, 16px);
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+}
+
+.card-title {
+  font-size: 18px;
+  font-weight: 600;
+  margin-bottom: var(--spacing-md, 12px);
+}

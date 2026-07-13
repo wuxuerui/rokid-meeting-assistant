@@ -114,6 +114,12 @@ export default {
     this.destroySession();
   },
 
+  onVoiceWakeup(event) {
+    const keyword = event && event.keyword ? event.keyword : '';
+    console.log(`[MeetingAssistant] voice wakeup: ${keyword}`);
+    this.analyzeNext();
+  },
+
   async checkCapabilities() {
     const recognitionAvailable = typeof SpeechRecognition !== 'undefined';
     if (!recognitionAvailable) {

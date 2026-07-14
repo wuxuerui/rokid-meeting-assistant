@@ -1,5 +1,6 @@
-# macOS
+# macOS metadata
 .DS_Store
+._*
 .AppleDouble
 .LSOverride
 

@@ -398,7 +398,11 @@ export default {
 
   finishRecognition(operationId, recognition, reason, error) {
     if (this.recognition === recognition) {
-      this.disposeRecognition(`cycle ${reason}`);
+      if (reason === 'end') {
+        this.releaseRecognition('cycle end');
+      } else {
+        this.disposeRecognition(`cycle ${reason}`);
+      }
     }
     this.recognitionRunning = false;
 
@@ -543,6 +547,21 @@ export default {
     }
     clearTimeout(this.restartTimer);
     this.restartTimer = null;
+  },
+
+  releaseRecognition(reason = 'completed') {
+    const recognition = this.recognition;
+    if (!recognition) {
+      this.recognitionRunning = false;
+      return;
+    }
+    this.recognition = null;
+    this.recognitionRunning = false;
+    recognition.onstart = null;
+    recognition.onresult = null;
+    recognition.onerror = null;
+    recognition.onend = null;
+    console.log(`[MeetingAssistant] recognition released: ${reason}`);
   },
 
   disposeRecognition(reason = 'cleanup') {

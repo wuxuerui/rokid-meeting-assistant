@@ -7,6 +7,12 @@
 <script setup>
 const SPEECH_LANG = 'zh-CN';
 const EMPTY_TRANSCRIPT = '未识别到有效语音，请重试。';
+const TOGGLE_DEBOUNCE_MS = 800;
+const EMPTY_RETRY_MS = 450;
+const NO_SPEECH_RETRY_MS = 650;
+const ERROR_RETRY_MS = 1200;
+const ANALYSIS_RESTART_MS = 350;
+const MAX_CONSECUTIVE_ASR_ERRORS = 5;
 const SYSTEM_PROMPT = `你是智能眼镜中的软件项目会议军师。
 
 请结合本场会议的连续上下文，重点检查：
@@ -92,7 +98,8 @@ export default {
     status: '正在检查能力',
     transcript: '暂无',
     cue: '暂无',
-    canAnalyze: false,
+    meetingActive: false,
+    canStart: false,
     isListening: false,
     isAnalyzing: false,
     lastError: '',
@@ -103,13 +110,31 @@ export default {
     this.recognition = null;
     this.finalTranscript = '';
     this.pageActive = true;
+    this.meetingActive = false;
+    this.recognitionRunning = false;
+    this.analysisRunning = false;
     this.operationId = 0;
     this.restartTimer = null;
+    this.consecutiveAsrErrors = 0;
+    this.lastToggleAt = 0;
+    this.destroySessionWhenIdle = false;
+    this.capabilitiesReady = false;
     await this.checkCapabilities();
   },
 
   async onShow() {
     this.pageActive = true;
+    this.meetingActive = false;
+    this.recognitionRunning = false;
+    this.clearRestartTimer();
+    this.setData({
+      meetingActive: false,
+      isListening: false,
+      isAnalyzing: this.analysisRunning,
+      canStart: false,
+      status: '正在检查能力',
+      lastError: '',
+    });
     await this.checkCapabilities();
   },
 
@@ -125,14 +150,15 @@ export default {
 
   onVoiceWakeup(event) {
     const keyword = event && event.keyword ? event.keyword : '';
-    console.log(`[MeetingAssistant] voice wakeup: ${keyword}`);
-    this.analyzeNext();
+    console.log('[MeetingAssistant] voice wakeup', keyword);
+    this.toggleMeeting('voice-wakeup');
   },
 
   async checkCapabilities() {
     const recognitionAvailable = typeof SpeechRecognition !== 'undefined';
     if (!recognitionAvailable) {
-      this.setFailure('SpeechRecognition 不可用');
+      this.capabilitiesReady = false;
+      this.setFailure('SpeechRecognition 不可用', false);
       return;
     }
 
@@ -142,26 +168,29 @@ export default {
         return;
       }
       if (availability !== 'available') {
-        this.setFailure('LanguageModel 不可用');
+        this.capabilitiesReady = false;
+        this.setFailure('LanguageModel 不可用', false);
         return;
       }
+      this.capabilitiesReady = true;
       this.setData({
-        status: '就绪',
-        canAnalyze: true,
+        status: '长按侧键开始',
+        canStart: !this.analysisRunning,
         lastError: '',
       });
     } catch (error) {
-      this.setFailure(`能力检查失败：${getErrorMessage(error)}`);
+      this.capabilitiesReady = false;
+      this.setFailure(`能力检查失败：${getErrorMessage(error)}`, false);
     }
   },
 
-  setFailure(message) {
+  setFailure(message, canStart = this.capabilitiesReady) {
     if (!this.pageActive) {
       return;
     }
     this.setData({
       status: '出错',
-      canAnalyze: false,
+      canStart,
       isListening: false,
       isAnalyzing: false,
       lastError: message,
@@ -176,117 +205,293 @@ export default {
     return this.session;
   },
 
-  analyzeNext() {
-    if (!this.data.canAnalyze || this.data.isListening || this.data.isAnalyzing) {
+  toggleMeeting(source = 'button') {
+    const trigger = typeof source === 'string' ? source : 'button';
+    const now = Date.now();
+    if (now - this.lastToggleAt < TOGGLE_DEBOUNCE_MS) {
+      console.log('[MeetingAssistant] duplicate toggle ignored');
+      return;
+    }
+    this.lastToggleAt = now;
+
+    if (this.meetingActive) {
+      this.stopMeeting(trigger);
+    } else {
+      this.startMeeting(trigger);
+    }
+  },
+
+  startMeeting(source = 'manual') {
+    if (!this.pageActive || !this.capabilitiesReady || this.analysisRunning) {
       return;
     }
 
+    this.clearRestartTimer();
+    this.disposeRecognition('start meeting');
+    this.destroySession('start new meeting');
     this.operationId += 1;
     const operationId = this.operationId;
+    this.meetingActive = true;
+    this.recognitionRunning = false;
+    this.analysisRunning = false;
+    this.consecutiveAsrErrors = 0;
+    this.destroySessionWhenIdle = false;
     this.finalTranscript = '';
-    this.disposeRecognition();
+    this.setData({
+      meetingActive: true,
+      status: '会议军师已开启',
+      transcript: '暂无',
+      cue: '暂无',
+      canStart: true,
+      isListening: false,
+      isAnalyzing: false,
+      lastError: '',
+    });
+    console.log('[MeetingAssistant] meeting started', source);
+    this.startRecognitionCycle(operationId);
+  },
 
-    const recognition = new SpeechRecognition();
+  stopMeeting(reason = 'manual') {
+    const wasActive = this.meetingActive;
+    this.meetingActive = false;
+    this.operationId += 1;
+    this.clearRestartTimer();
+    this.disposeRecognition(reason);
+    this.recognitionRunning = false;
+    this.finalTranscript = '';
+
+    if (this.analysisRunning) {
+      this.destroySessionWhenIdle = true;
+    } else {
+      this.destroySession(reason);
+      this.destroySessionWhenIdle = false;
+    }
+
+    if (this.pageActive) {
+      this.setData({
+        meetingActive: false,
+        status: '会议已停止',
+        isListening: false,
+        isAnalyzing: this.analysisRunning,
+        canStart: this.capabilitiesReady && !this.analysisRunning,
+      });
+    }
+    if (wasActive || reason !== 'manual') {
+      console.log(`[MeetingAssistant] meeting stopped: ${reason}`);
+    }
+  },
+
+  analyzeNext() {
+    if (!this.meetingActive) {
+      this.startMeeting('analyze-next');
+    }
+  },
+
+  canRunRecognition(operationId) {
+    return (
+      this.pageActive &&
+      this.meetingActive &&
+      this.operationId === operationId &&
+      !this.recognitionRunning &&
+      !this.analysisRunning &&
+      !this.recognition &&
+      !this.restartTimer
+    );
+  },
+
+  startRecognitionCycle(operationId) {
+    if (!this.canRunRecognition(operationId)) {
+      return;
+    }
+
+    this.finalTranscript = '';
+    this.recognitionRunning = true;
+    let recognition;
+    let finished = false;
+    const finalParts = [];
+
+    const finish = (reason, error = null) => {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      this.finishRecognition(operationId, recognition, reason, error);
+    };
+
+    try {
+      recognition = new SpeechRecognition();
+    } catch (error) {
+      this.recognitionRunning = false;
+      console.error('[MeetingAssistant] ASR error:', error);
+      this.handleAsrFailure(operationId, 'start-failed', error);
+      return;
+    }
+
     recognition.lang = SPEECH_LANG;
     recognition.continuous = false;
-    recognition.interimResults = true;
+    recognition.interimResults = false;
     recognition.maxAlternatives = 1;
 
     recognition.onstart = () => {
-      if (!this.isCurrent(operationId)) {
+      if (!this.isRecognitionCurrent(operationId, recognition)) {
         return;
       }
+      console.log('[MeetingAssistant] ASR listening');
       this.setData({
         status: '正在聆听',
-        transcript: '正在识别…',
-        cue: '暂无',
         isListening: true,
         lastError: '',
       });
     };
 
     recognition.onresult = (event) => {
-      if (!this.isCurrent(operationId)) {
+      if (!this.isRecognitionCurrent(operationId, recognition)) {
         return;
       }
       const result = extractTranscript(event);
-      if (result.transcript) {
-        this.setData({ transcript: result.transcript });
-      }
-      if (result.hasFinal && result.transcript) {
-        this.finalTranscript = result.transcript;
+      if (result.transcript && (result.hasFinal || recognition.interimResults === false)) {
+        finalParts.push(result.transcript);
+        this.finalTranscript = normalizeText(finalParts.join(''));
+        this.setData({ transcript: this.finalTranscript });
+        console.log('[MeetingAssistant] ASR final:', this.finalTranscript);
       }
     };
 
     recognition.onerror = (event) => {
-      if (!this.isCurrent(operationId)) {
+      if (!this.isRecognitionCurrent(operationId, recognition)) {
         return;
       }
-      this.recognition = null;
-      this.operationId += 1;
-      const message = event && event.message
-        ? `${event.error || 'error'}: ${event.message}`
-        : '语音识别失败';
-      this.setFailure(message);
-      this.setData({ canAnalyze: true });
+      console.error('[MeetingAssistant] ASR error:', event);
+      finish('error', event);
     };
 
-    recognition.onend = async () => {
-      if (this.recognition === recognition) {
-        this.recognition = null;
-      }
-      if (!this.isCurrent(operationId)) {
-        return;
-      }
-
-      const transcript = normalizeText(this.finalTranscript || this.data.transcript);
-      this.setData({ isListening: false });
-      if (!transcript || transcript === '正在识别…') {
-        this.setData({
-          status: '就绪',
-          transcript: EMPTY_TRANSCRIPT,
-          canAnalyze: true,
-        });
-        return;
-      }
-
-      this.setData({ transcript });
-      await this.requestCue(operationId, transcript);
+    recognition.onend = () => {
+      console.log('[MeetingAssistant] ASR end');
+      finish('end');
     };
 
     this.recognition = recognition;
     this.setData({
       status: '正在启动识别',
-      canAnalyze: false,
+      meetingActive: true,
       isListening: true,
       lastError: '',
     });
 
     try {
+      console.log('[MeetingAssistant] ASR start');
       recognition.start();
     } catch (error) {
-      this.disposeRecognition();
-      this.setFailure(`无法启动识别：${getErrorMessage(error)}`);
-      this.setData({ canAnalyze: true });
+      console.error('[MeetingAssistant] ASR error:', error);
+      finish('error', { error: 'start-failed', message: getErrorMessage(error) });
     }
   },
 
-  async requestCue(operationId, transcript) {
-    if (!this.isCurrent(operationId) || this.data.isAnalyzing) {
+  isRecognitionCurrent(operationId, recognition) {
+    return (
+      this.pageActive &&
+      this.meetingActive &&
+      this.operationId === operationId &&
+      this.recognition === recognition
+    );
+  },
+
+  finishRecognition(operationId, recognition, reason, error) {
+    if (this.recognition === recognition) {
+      this.disposeRecognition(`cycle ${reason}`);
+    }
+    this.recognitionRunning = false;
+
+    if (!this.isMeetingOperation(operationId)) {
       return;
     }
 
+    this.setData({ isListening: false });
+    if (reason === 'error') {
+      const errorCode = error && error.error ? error.error : 'unknown';
+      if (errorCode === 'aborted') {
+        this.scheduleNextRecognition(operationId, 'aborted', NO_SPEECH_RETRY_MS);
+        return;
+      }
+      if (errorCode === 'no-speech') {
+        this.setData({ status: '未听到语音，继续聆听', lastError: '' });
+        this.scheduleNextRecognition(operationId, 'no-speech', NO_SPEECH_RETRY_MS);
+        return;
+      }
+      this.handleAsrFailure(operationId, errorCode, error);
+      return;
+    }
+
+    const transcript = normalizeText(this.finalTranscript);
+    if (!transcript) {
+      this.setData({
+        status: '未识别到语音，继续聆听',
+        transcript: EMPTY_TRANSCRIPT,
+      });
+      console.log('[MeetingAssistant] ASR empty, retry scheduled');
+      this.scheduleNextRecognition(operationId, 'empty', EMPTY_RETRY_MS);
+      return;
+    }
+
+    this.consecutiveAsrErrors = 0;
+    this.setData({ transcript });
+    this.requestCue(operationId, transcript);
+  },
+
+  handleAsrFailure(operationId, errorCode, error) {
+    if (!this.isMeetingOperation(operationId)) {
+      return;
+    }
+    this.consecutiveAsrErrors += 1;
+    const message = getErrorMessage(error) || errorCode;
+    if (this.consecutiveAsrErrors >= MAX_CONSECUTIVE_ASR_ERRORS) {
+      this.stopMeeting('asr-error-limit');
+      if (this.pageActive) {
+        this.setData({
+          status: '识别连续失败，请长按重试',
+          lastError: message,
+          canStart: this.capabilitiesReady,
+        });
+      }
+      return;
+    }
+    this.setData({
+      status: '识别失败，准备重试',
+      lastError: message,
+    });
+    this.scheduleNextRecognition(operationId, errorCode, ERROR_RETRY_MS);
+  },
+
+  scheduleNextRecognition(operationId, reason, delayMs) {
+    if (!this.isMeetingOperation(operationId) || this.restartTimer) {
+      return;
+    }
+    console.log(`[MeetingAssistant] ASR restart scheduled: ${reason}`);
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null;
+      if (!this.isMeetingOperation(operationId)) {
+        return;
+      }
+      this.startRecognitionCycle(operationId);
+    }, delayMs);
+  },
+
+  async requestCue(operationId, transcript) {
+    if (!this.isMeetingOperation(operationId) || this.analysisRunning || !transcript) {
+      return;
+    }
+
+    this.analysisRunning = true;
     this.setData({
       status: '正在分析',
       isAnalyzing: true,
-      canAnalyze: false,
-      cue: '正在生成提示…',
+      isListening: false,
       lastError: '',
     });
 
     try {
       const session = await this.ensureSession();
-      if (!this.isCurrent(operationId)) {
+      if (!this.isMeetingOperation(operationId)) {
         return;
       }
 
@@ -294,32 +499,42 @@ export default {
       const result = await session.prompt(transcript);
       console.log('[MeetingAssistant] prompt completed:', result);
 
-      if (!this.isCurrent(operationId)) {
+      if (!this.isMeetingOperation(operationId)) {
         return;
       }
       const cue = formatCue(result);
-      this.setData({
-        status: '就绪',
-        cue: cue === 'NO_CUE' ? '暂无需追问' : cue,
-      });
+      if (cue === 'NO_CUE') {
+        this.setData({ status: '暂无新的提示' });
+      } else {
+        this.setData({ status: '已生成新提示', cue });
+      }
     } catch (error) {
       console.error('[MeetingAssistant] prompt failed:', error);
-      if (!this.isCurrent(operationId)) {
-        return;
-      }
-      this.setFailure(`分析失败：${getErrorMessage(error)}`);
-    } finally {
-      if (this.isCurrent(operationId)) {
+      if (this.isMeetingOperation(operationId)) {
         this.setData({
-          isAnalyzing: false,
-          canAnalyze: true,
+          status: '分析失败，继续聆听',
+          lastError: getErrorMessage(error),
         });
+      }
+    } finally {
+      this.analysisRunning = false;
+      if (this.pageActive) {
+        this.setData({ isAnalyzing: false });
+      }
+      if (this.destroySessionWhenIdle) {
+        this.destroySessionWhenIdle = false;
+        this.destroySession('analysis idle');
+      }
+      if (this.isMeetingOperation(operationId)) {
+        this.scheduleNextRecognition(operationId, 'analysis-complete', ANALYSIS_RESTART_MS);
+      } else if (this.pageActive) {
+        this.setData({ canStart: this.capabilitiesReady });
       }
     }
   },
 
-  isCurrent(operationId) {
-    return this.pageActive && this.operationId === operationId;
+  isMeetingOperation(operationId) {
+    return this.pageActive && this.meetingActive && this.operationId === operationId;
   },
 
   clearRestartTimer() {
@@ -333,9 +548,11 @@ export default {
   disposeRecognition(reason = 'cleanup') {
     const recognition = this.recognition;
     if (!recognition) {
+      this.recognitionRunning = false;
       return;
     }
     this.recognition = null;
+    this.recognitionRunning = false;
     try {
       recognition.onstart = null;
       recognition.onresult = null;
@@ -360,23 +577,30 @@ export default {
 
   cleanupPage(reason) {
     this.pageActive = false;
-    this.operationId += 1;
+    this.stopMeeting(reason);
     this.clearRestartTimer();
     this.disposeRecognition(reason);
-    this.destroySession(reason);
+    if (!this.analysisRunning) {
+      this.destroySession(reason);
+    }
     console.log(`[MeetingAssistant] cleanup completed: ${reason}`);
   },
 
   async resetSession() {
+    if (this.meetingActive || this.analysisRunning) {
+      return;
+    }
     this.operationId += 1;
-    this.disposeRecognition();
-    this.destroySession();
+    this.clearRestartTimer();
+    this.disposeRecognition('reset');
+    this.destroySession('reset');
     this.finalTranscript = '';
     this.setData({
       status: '正在重置',
       transcript: '暂无',
       cue: '暂无',
-      canAnalyze: false,
+      meetingActive: false,
+      canStart: false,
       isListening: false,
       isAnalyzing: false,
       lastError: '',
@@ -402,15 +626,17 @@ export default {
     </view>
 
     <view class="card cue-card">
-      <text class="label">最近一次军师提示</text>
+      <text class="label">最新提示</text>
       <text class="cue">{{cue}}</text>
     </view>
 
+    <text class="meeting-hint">{{meetingActive ? '长按侧键停止' : '长按侧键开始'}}</text>
+
     <view class="actions" role="navigation">
-      <button class="primary" bindtap="analyzeNext" disabled="{{!canAnalyze}}">
-        {{isListening ? '正在聆听' : (isAnalyzing ? '正在分析' : '分析下一段')}}
+      <button class="primary" bindtap="toggleMeeting" disabled="{{!meetingActive && !canStart}}">
+        {{meetingActive ? '停止会议' : '开始会议'}}
       </button>
-      <button class="secondary" bindtap="resetSession">重置会话</button>
+      <button class="secondary" bindtap="resetSession" disabled="{{meetingActive || isAnalyzing}}">重置会话</button>
     </view>
   </view>
 </page>
@@ -470,6 +696,12 @@ page {
 .error {
   color: #ff8585;
   font-size: 14px;
+}
+
+.meeting-hint {
+  color: #9eabbc;
+  font-size: 15px;
+  text-align: center;
 }
 
 .actions {

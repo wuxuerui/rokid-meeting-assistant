@@ -104,14 +104,23 @@ export default {
     this.finalTranscript = '';
     this.pageActive = true;
     this.operationId = 0;
+    this.restartTimer = null;
     await this.checkCapabilities();
   },
 
+  async onShow() {
+    this.pageActive = true;
+    await this.checkCapabilities();
+  },
+
+  onHide() {
+    console.log('[MeetingAssistant] page hidden');
+    this.cleanupPage('hidden');
+  },
+
   onUnload() {
-    this.pageActive = false;
-    this.operationId += 1;
-    this.disposeRecognition();
-    this.destroySession();
+    console.log('[MeetingAssistant] page unloaded');
+    this.cleanupPage('unloaded');
   },
 
   onVoiceWakeup(event) {
@@ -313,7 +322,15 @@ export default {
     return this.pageActive && this.operationId === operationId;
   },
 
-  disposeRecognition() {
+  clearRestartTimer() {
+    if (!this.restartTimer) {
+      return;
+    }
+    clearTimeout(this.restartTimer);
+    this.restartTimer = null;
+  },
+
+  disposeRecognition(reason = 'cleanup') {
     const recognition = this.recognition;
     if (!recognition) {
       return;
@@ -326,9 +343,10 @@ export default {
       recognition.onend = null;
       recognition.abort();
     } catch (_error) {}
+    console.log(`[MeetingAssistant] recognition disposed: ${reason}`);
   },
 
-  destroySession() {
+  destroySession(reason = 'cleanup') {
     const session = this.session;
     this.session = null;
     if (!session) {
@@ -337,6 +355,16 @@ export default {
     try {
       session.destroy();
     } catch (_error) {}
+    console.log(`[MeetingAssistant] session destroyed: ${reason}`);
+  },
+
+  cleanupPage(reason) {
+    this.pageActive = false;
+    this.operationId += 1;
+    this.clearRestartTimer();
+    this.disposeRecognition(reason);
+    this.destroySession(reason);
+    console.log(`[MeetingAssistant] cleanup completed: ${reason}`);
   },
 
   async resetSession() {
